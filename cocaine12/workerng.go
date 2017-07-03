@@ -38,18 +38,27 @@ var (
 )
 
 type requestStream interface {
-	push(*Message)
+	push(*message)
 	Close()
 }
 
 // Request provides an interface for a handler to get data
 type Request interface {
+	// Headers returns associated headers.
+	// The value is shared accross all callers.
+	// Read call overrides headers with headers from a new message
+	Headers() CocaineHeaders
+	// Read returns binary user's data and resets headers.
+	// To get headers from incoming message call Headers method after Read
 	Read(ctx context.Context) ([]byte, error)
 }
 
 // ResponseStream provides an interface for a handler to reply
 type ResponseStream interface {
 	io.WriteCloser
+	// SetHeaders sets the headers to send with next message
+	// NOTE: it's experimental API
+	SetHeaders(CocaineHeaders)
 	// ZeroCopyWrite sends data to a client.
 	// Response takes the ownership of the buffer, so provided buffer must not be edited.
 	ZeroCopyWrite(data []byte) error
@@ -326,48 +335,46 @@ func (w *WorkerNG) sendHandshake() error {
 
 // Message handlers
 
-func (w *WorkerNG) onChoke(msg *Message) {
-	if reqStream, ok := w.sessions[msg.Session]; ok {
+func (w *WorkerNG) onChoke(msg *message) {
+	if reqStream, ok := w.sessions[msg.session]; ok {
 		reqStream.Close()
-		delete(w.sessions, msg.Session)
+		delete(w.sessions, msg.session)
 	}
 }
 
-func (w *WorkerNG) onChunk(msg *Message) {
-	if reqStream, ok := w.sessions[msg.Session]; ok {
+func (w *WorkerNG) onChunk(msg *message) {
+	if reqStream, ok := w.sessions[msg.session]; ok {
 		reqStream.push(msg)
 	}
 }
 
-func (w *WorkerNG) onError(msg *Message) {
-	if reqStream, ok := w.sessions[msg.Session]; ok {
+func (w *WorkerNG) onError(msg *message) {
+	if reqStream, ok := w.sessions[msg.session]; ok {
 		reqStream.push(msg)
 	}
 }
 
-func (w *WorkerNG) onInvoke(msg *Message) error {
-	event, ok := getEventName(msg)
-	if !ok {
+func (w *WorkerNG) onInvoke(msg *message) error {
+	var event eventName
+	if _, err := event.UnmarshalMsg(msg.payload); err != nil {
 		// corrupted message
-		return fmt.Errorf("unable to get an event name from %s", msg.String())
+		return fmt.Errorf("unable to get an event name from %s: %v", msg.String(), err)
 	}
 
 	var (
-		currentSession = msg.Session
-		ctx            context.Context
+		currentSession = msg.session
+		ctx            = context.Background()
 	)
-
-	ctx = context.Background()
-
-	if traceInfo, err := msg.Headers.getTraceData(); err == nil {
+	if traceInfo, err := msg.headers.getTraceData(); err == nil {
 		ctx = AttachTraceInfo(ctx, traceInfo)
 	}
 
 	responseStream := newResponse(w.dispatcher, currentSession, w.conn)
-	requestStream := newRequest(w.dispatcher)
+	requestStream := newRequest(w.dispatcher, msg.headers)
 	w.sessions[currentSession] = requestStream
 
 	go func() {
+		event := string(event)
 		// this trap catches a panic from a handler
 		// and checks if the response is closed.
 		defer trapRecoverAndClose(ctx, event, responseStream, w.debug)
@@ -380,16 +387,17 @@ func (w *WorkerNG) onInvoke(msg *Message) error {
 	return nil
 }
 
-func (w *WorkerNG) onHeartbeat(msg *Message) {
+func (w *WorkerNG) onHeartbeat(msg *message) {
 	// Reply to a heartbeat has been received,
 	// so we are not disowned & disownTimer must be stopped
 	// It will be launched when the next heartbeat is sent
 	w.disownTimer.Stop()
 }
 
-func (w *WorkerNG) onTerminate(msg *Message) {
+func (w *WorkerNG) onTerminate(msg *message) {
 	if w.terminationHandler != nil {
 		ctx, cancelTimeout := context.WithTimeout(context.Background(), terminationTimeout)
+		defer cancelTimeout()
 		onDone := make(chan struct{})
 		go func() {
 			w.terminationHandler(ctx)
@@ -398,7 +406,6 @@ func (w *WorkerNG) onTerminate(msg *Message) {
 
 		select {
 		case <-onDone:
-			cancelTimeout()
 		case <-ctx.Done():
 			fmt.Printf("terminationHandler timeouted: %v\n", ctx.Err())
 		}

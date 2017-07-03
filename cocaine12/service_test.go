@@ -11,6 +11,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestResolveService(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipped without Cocaine")
+	}
+	ctx, c := context.WithTimeout(context.Background(), time.Second*3)
+	defer c()
+	_, err := serviceResolve(ctx, "locator", nil)
+	assert.NoError(t, err)
+}
+
 func TestCreateIO(t *testing.T) {
 	if _, err := serviceCreateIO(nil); err != ErrZeroEndpoints {
 		t.Fatalf("%v is expected, but %v has been returned", ErrZeroEndpoints, err)
@@ -37,8 +47,6 @@ func TestCreateIO(t *testing.T) {
 	if len(merr.Error()) == 0 {
 		t.Fatal("merr.Error() is empty")
 	}
-
-	fmt.Println(merr.Error())
 }
 
 func TestService(t *testing.T) {
@@ -51,7 +59,8 @@ func TestService(t *testing.T) {
 		wg                 sync.WaitGroup
 	)
 
-	ctx := context.Background()
+	ctx, c := context.WithTimeout(context.Background(), time.Second*3)
+	defer c()
 	s, err := NewService(ctx, "echo", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -109,8 +118,8 @@ func TestDisconnectedError(t *testing.T) {
 		t.Skip("skipped without Cocaine")
 	}
 
-	ctx := context.Background()
-
+	ctx, c := context.WithTimeout(context.Background(), time.Second*3)
+	defer c()
 	s, err := NewService(ctx, "locator", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -131,8 +140,8 @@ func TestReconnection(t *testing.T) {
 		t.Skip("skipped without Cocaine")
 	}
 
-	ctx := context.Background()
-
+	ctx, c := context.WithTimeout(context.Background(), time.Second*3)
+	defer c()
 	s, err := NewService(ctx, "locator", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -157,13 +166,15 @@ func TestTimeoutError(t *testing.T) {
 		t.Skip("skipped without Cocaine")
 	}
 
-	ctx := context.Background()
+	ctx, c := context.WithTimeout(context.Background(), time.Second*3)
+	defer c()
 	s, err := NewService(ctx, "locator", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, _ = context.WithTimeout(context.Background(), time.Microsecond*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Microsecond*5)
+	defer cancel()
 	// passing wrong arguments leads to disconnect
 	ch, err := s.Call(ctx, "resolve", "locator")
 	if err != nil {
@@ -182,7 +193,8 @@ func TestRxClosedGet(t *testing.T) {
 		t.Skip("skipped without Cocaine")
 	}
 
-	ctx, _ := context.WithTimeout(context.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
 	s, err := NewService(ctx, "locator", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -202,6 +214,7 @@ func TestRxClosedGet(t *testing.T) {
 	}
 
 	_, err = ch.Get(ctx)
+	assert.NoError(t, err)
 	_, err = ch.Get(ctx)
 	assert.EqualError(t, err, ErrStreamIsClosed.Error())
 }

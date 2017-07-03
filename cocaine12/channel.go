@@ -78,7 +78,6 @@ func (rx *rx) Get(ctx context.Context) (ServiceResult, error) {
 			return nil, ctx.Err()
 		}
 	}
-
 	treeMap := *(rx.rxTree)
 	method, _, _ := res.Result()
 	temp := treeMap[method]
@@ -96,7 +95,7 @@ func (rx *rx) Get(ctx context.Context) (ServiceResult, error) {
 	switch temp.Name {
 	case "error":
 		var (
-			catAndCode [2]int
+			catAndCode [2]uint64
 			message    string
 		)
 
@@ -134,11 +133,13 @@ type tx struct {
 	txTree  *streamDescription
 	id      uint64
 	done    bool
-
-	headers CocaineHeaders
 }
 
 func (tx *tx) Call(ctx context.Context, name string, args ...interface{}) error {
+	return tx.CallWithHeaders(ctx, nil, name, args)
+}
+
+func (tx *tx) CallWithHeaders(ctx context.Context, headers CocaineHeaders, name string, args ...interface{}) error {
 	if tx.done {
 		return fmt.Errorf("tx is done")
 	}
@@ -154,20 +155,16 @@ func (tx *tx) Call(ctx context.Context, name string, args ...interface{}) error 
 	switch temp.Description.Type() {
 	case emptyDispatch:
 		tx.done = true
-
 	case recursiveDispatch:
 		//pass
-
 	case otherDispatch:
 		tx.txTree = temp.Description
 	}
 
-	msg := &Message{
-		CommonMessageInfo: CommonMessageInfo{tx.id, method},
-		Payload:           args,
-		Headers:           tx.headers,
+	msg, err := newMessage(tx.id, method, args, headers)
+	if err != nil {
+		return err
 	}
-
 	tx.service.sendMsg(msg)
 	return nil
 }

@@ -5,12 +5,15 @@ import (
 	"errors"
 	"io"
 	"syscall"
+
+	"github.com/tinylib/msgp/msgp"
 )
 
 type request struct {
 	messageTypeDetector
-	fromWorker chan *Message
-	toHandler  chan *Message
+	headers    CocaineHeaders
+	fromWorker chan *message
+	toHandler  chan *message
 	closed     chan struct{}
 }
 
@@ -33,12 +36,13 @@ var (
 	}
 )
 
-func newRequest(mtd messageTypeDetector) *request {
+func newRequest(mtd messageTypeDetector, headers CocaineHeaders) *request {
 	request := &request{
 		messageTypeDetector: mtd,
-		fromWorker:          make(chan *Message),
-		toHandler:           make(chan *Message),
+		fromWorker:          make(chan *message),
+		toHandler:           make(chan *message),
 		closed:              make(chan struct{}),
+		headers:             headers,
 	}
 
 	go loop(
@@ -53,6 +57,13 @@ func newRequest(mtd messageTypeDetector) *request {
 	return request
 }
 
+// Headers returns current associated headers. Next Read call
+// will override associated headers.
+// Multiple calls of the method returns the same shared Headers value.
+func (request *request) Headers() CocaineHeaders {
+	return request.headers
+}
+
 func (request *request) Read(ctx context.Context) ([]byte, error) {
 	select {
 	// Choke never reaches this select,
@@ -63,38 +74,33 @@ func (request *request) Read(ctx context.Context) ([]byte, error) {
 			return nil, ErrStreamIsClosed
 		}
 
+		// reset current headers
+		request.headers = msg.headers
+
 		if request.isChunk(msg) {
-			if result, isByte := msg.Payload[0].([]byte); isByte {
-				return result, nil
+			sz, b, err := msgp.ReadArrayHeaderBytes(msg.payload)
+			if err != nil || sz != 1 {
+				return nil, ErrBadPayload
 			}
-			return nil, ErrBadPayload
+			// NOTE: ZeroCopy unpacking
+			result, _, err := msgp.ReadBytesZC(b)
+			if err != nil {
+				return nil, ErrBadPayload
+			}
+			return result, nil
 		}
 
-		// Error message
-		if len(msg.Payload) == 0 {
-			return nil, ErrMalformedErrorMessage
-		}
-
-		var perr struct {
-			CodeInfo [2]int
-			Message  string
-		}
-
-		if err := convertPayload(msg.Payload, &perr); err != nil {
+		var errRequest = new(ErrRequest)
+		if _, err := errRequest.UnmarshalMsg(msg.payload); err != nil {
 			return nil, err
 		}
-
-		return nil, &ErrRequest{
-			Message:  perr.Message,
-			Category: perr.CodeInfo[0],
-			Code:     perr.CodeInfo[1],
-		}
+		return nil, errRequest
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (request *request) push(msg *Message) {
+func (request *request) push(msg *message) {
 	request.fromWorker <- msg
 }
 
@@ -107,6 +113,7 @@ type response struct {
 	session  uint64
 	toWorker asyncSender
 	closed   bool
+	headers  CocaineHeaders
 }
 
 func newResponse(h handlerProtocolGenerator, session uint64, toWorker asyncSender) *response {
@@ -118,6 +125,14 @@ func newResponse(h handlerProtocolGenerator, session uint64, toWorker asyncSende
 	}
 
 	return response
+}
+
+// SetHeaders sets headers to send with next Write/Close/ZeroCopyWrite
+// TODO: may be it should look like http.ResponseWriter
+// it provides Headers() method to return writable value of the headers
+// which will be sent with next Write
+func (r *response) SetHeaders(headers CocaineHeaders) {
+	r.headers = headers
 }
 
 // Write sends chunk of data to a client.
@@ -140,7 +155,12 @@ func (r *response) ZeroCopyWrite(data []byte) error {
 		return io.ErrClosedPipe
 	}
 
-	r.toWorker.Send(r.newChunk(r.session, data))
+	msg := r.newChunk(r.session, data)
+	if r.headers != nil {
+		msg.headers = r.headers
+		r.headers = nil
+	}
+	r.toWorker.Send(msg)
 	return nil
 }
 
@@ -152,7 +172,13 @@ func (r *response) Close() error {
 	}
 
 	r.close()
-	r.toWorker.Send(r.newChoke(r.session))
+
+	msg := r.newChoke(r.session)
+	if r.headers != nil {
+		msg.headers = r.headers
+		r.headers = nil
+	}
+	r.toWorker.Send(msg)
 	return nil
 }
 
@@ -163,7 +189,8 @@ func (r *response) ErrorMsg(code int, message string) error {
 	}
 
 	r.close()
-	r.toWorker.Send(r.newError(
+
+	msg := r.newError(
 		// current session number
 		r.session,
 		// category
@@ -172,7 +199,12 @@ func (r *response) ErrorMsg(code int, message string) error {
 		code,
 		// error message
 		message,
-	))
+	)
+	if r.headers != nil {
+		msg.headers = r.headers
+		r.headers = nil
+	}
+	r.toWorker.Send(msg)
 	return nil
 }
 
@@ -184,18 +216,18 @@ func (r *response) isClosed() bool {
 	return r.closed
 }
 
-func loop(input <-chan *Message, output chan *Message, onclose <-chan struct{}) {
+func loop(input <-chan *message, output chan *message, onclose <-chan struct{}) {
 	defer close(output)
 
 	var (
-		pending []*Message
+		pending []*message
 		closed  = onclose
 	)
 
 	for {
 		var (
-			out   chan *Message
-			first *Message
+			out   chan *message
+			first *message
 		)
 
 		if len(pending) > 0 {

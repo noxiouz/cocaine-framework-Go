@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/tinylib/msgp/msgp"
 )
 
 const (
@@ -52,13 +54,15 @@ type ServiceResult interface {
 	ExtractTuple(...interface{}) error
 	Result() (uint64, []interface{}, error)
 	Err() error
+	Headers() CocaineHeaders
 
 	setError(error)
 }
 
 type serviceRes struct {
-	payload []interface{}
+	payload msgp.Raw
 	method  uint64
+	headers CocaineHeaders
 	err     error
 }
 
@@ -75,16 +79,32 @@ func (s *serviceRes) ExtractTuple(args ...interface{}) error {
 	return s.Extract(&args)
 }
 
-// ToDo: Extract method for an array semantic
-// Extract(target ...interface{})
-
 func (s *serviceRes) Result() (uint64, []interface{}, error) {
-	return s.method, s.payload, s.err
+	sz, b, err := msgp.ReadArrayHeaderBytes(s.payload)
+	if err != nil {
+		return s.method, nil, err
+	}
+
+	args := make([]interface{}, 0, sz)
+	var value interface{}
+	for ; sz > 0; sz-- {
+		value, b, err = msgp.ReadIntfBytes(b)
+		if err != nil {
+			return s.method, nil, err
+		}
+		args = append(args, value)
+	}
+
+	return s.method, args, s.err
 }
 
 //Error status
 func (s *serviceRes) Err() error {
 	return s.err
+}
+
+func (s *serviceRes) Headers() CocaineHeaders {
+	return s.headers
 }
 
 func (s *serviceRes) Error() string {
@@ -98,7 +118,6 @@ func (s *serviceRes) setError(err error) {
 	s.err = err
 }
 
-//
 type ServiceError struct {
 	Code    int
 	Message string
@@ -190,10 +209,11 @@ func (service *Service) loop() {
 	epoch := service.epoch
 
 	for data := range service.socketIO.Read() {
-		if rx, ok := service.sessions.Get(data.Session); ok {
+		if rx, ok := service.sessions.Get(data.session); ok {
 			rx.push(&serviceRes{
-				payload: data.Payload,
-				method:  data.MsgType,
+				payload: data.payload,
+				method:  data.msgType,
+				headers: data.headers,
 			})
 		}
 	}
@@ -254,7 +274,7 @@ func (service *Service) pushDisconnectedError() {
 	}
 }
 
-func (service *Service) call(ctx context.Context, name string, args ...interface{}) (Channel, error) {
+func (service *Service) call(ctx context.Context, headers CocaineHeaders, name string, args ...interface{}) (Channel, error) {
 	service.mutex.RLock()
 	defer service.mutex.RUnlock()
 
@@ -267,7 +287,6 @@ func (service *Service) call(ctx context.Context, name string, args ...interface
 	}
 
 	var (
-		headers           = CocaineHeaders{}
 		traceSentCall     = closeDummySpan
 		traceReceivedCall = closeDummySpan
 	)
@@ -280,11 +299,10 @@ func (service *Service) call(ctx context.Context, name string, args ...interface
 		spanHex := fmt.Sprintf("%x", traceInfo.span)
 		parentHex := fmt.Sprintf("%x", traceInfo.parent)
 
-		var err error
-		headers, err = traceInfoToHeaders(traceInfo)
-		if err != nil {
-			traceInfo.getLog().Err("unable to pack trace info into headers")
+		if headers == nil {
+			headers = make(CocaineHeaders)
 		}
+		traceInfoToHeaders(headers, traceInfo)
 
 		traceSentCall = func() {
 			traceInfo.getLog().WithFields(Fields{
@@ -320,7 +338,6 @@ func (service *Service) call(ctx context.Context, name string, args ...interface
 			txTree:  service.ServiceInfo.API[methodNum].Downstream,
 			id:      0,
 			done:    false,
-			headers: headers,
 		},
 	}
 
@@ -331,12 +348,10 @@ func (service *Service) call(ctx context.Context, name string, args ...interface
 
 	ch.tx.id = service.sessions.Attach(&ch)
 
-	msg := &Message{
-		CommonMessageInfo: CommonMessageInfo{ch.tx.id, methodNum},
-		Payload:           args,
-		Headers:           headers,
+	msg, err := newMessage(ch.tx.id, methodNum, args, headers)
+	if err != nil {
+		return nil, err
 	}
-
 	service.sendMsg(msg)
 	return &ch, nil
 }
@@ -350,14 +365,19 @@ func (service *Service) disconnected() bool {
 	}
 }
 
-func (service *Service) sendMsg(msg *Message) {
+func (service *Service) sendMsg(msg *message) {
 	service.mutex.RLock()
 	service.socketIO.Send(msg)
 	service.mutex.RUnlock()
 }
 
-//Calls a remote method by name and pass args
+// Call a remote method by name and pass args
 func (service *Service) Call(ctx context.Context, name string, args ...interface{}) (Channel, error) {
+	return service.CallWithHeaders(ctx, nil, name, args)
+}
+
+// CallWithHeaders calls a remote method by name and pass headers and args
+func (service *Service) CallWithHeaders(ctx context.Context, headers CocaineHeaders, name string, args ...interface{}) (Channel, error) {
 	service.mutex.RLock()
 	disconnected := service.disconnected()
 	service.mutex.RUnlock()
@@ -368,10 +388,10 @@ func (service *Service) Call(ctx context.Context, name string, args ...interface
 		}
 	}
 
-	return service.call(ctx, name, args...)
+	return service.call(ctx, headers, name, args...)
 }
 
-// Disposes resources of a service. You must call this method if the service isn't used anymore.
+// Close disposes resources of a service. You must call this method if the service isn't used anymore.
 func (service *Service) Close() {
 	service.mutex.RLock()
 	// Broadcast all related
